@@ -1,0 +1,908 @@
+import pluggable.scm.*;
+SCMProvider scmProvider = SCMProviderHandler.getScmProvider("${SCM_PROVIDER_ID}", binding.variables)
+
+// Folders
+def workspaceFolderName = "${WORKSPACE_NAME}"
+def projectFolderName = "${PROJECT_NAME}"
+def projectScmNamespace = "${SCM_NAMESPACE}"
+def projectNameKey = projectFolderName.toLowerCase().replace("/", "-");
+
+// Variables
+//def referenceAppGitUrl = "ssh://jenkins@gerrit:29418/${PROJECT_NAME}/${GIT_REPOSITORY_NAME}";
+//def devopsToolsGitUrl = "ssh://jenkins@gerrit:29418/${PROJECT_NAME}/megatron-aem-devops-tools.git";
+//def contentGitUrl = "ssh://jenkins@gerrit:29418/${PROJECT_NAME}/megatron-aem-content.git";
+def gitRepoName = "${GIT_REPOSITORY_NAME}"
+def gitRepoBranch = "${GIT_REPOSITORY_BRANCH}"
+
+//Docker Variables
+def dockerRegistryUser = "${DOCKER_REGISTRY_USERNAME}"
+def dockerRegistryPass = "${DOCKER_REGISTRY_PASSWORD}"
+def dockerRegistryEmail = "${DOCKER_REGISTRY_EMAIL}"
+def dockerRegistryUrl = "${DOCKER_REGISTRY_URL}"
+def dockerRegistryRepo = "${DOCKER_REGISTRY_REPO}"
+
+//AEM External User Data
+def contentAdminUser = "${CONTENT_ADMIN_USER}"
+def contentAdminPass = "${CONTENT_ADMIN_PASS}"
+
+//AEM license values
+def aemProductName = "${AEM_PRODUCT_NAME}"
+def aemCustomerName = "${AEM_CUSTOMER_NAME}"
+def aemProductVersion = "${AEM_PRODUCT_VERSION}"
+def aemDownloadId = "${AEM_DOWNLOAD_ID}"
+
+// Log rotator variables
+def logRotatorNum = 5
+def logRotatorArtifactNum = 3
+def logRotatorDays = -1
+def logRotatorArtifactDays = -1
+
+// Environment jobs
+def buildandPushBaseImageJob = freeStyleJob(projectFolderName + "/AEM_Build_Base_Image")
+def buildandPushImageJob = freeStyleJob(projectFolderName + "/AEM_Build_Author_Publish_Image")
+def deployAuthorJob = freeStyleJob(projectFolderName + "/AEM_Deploy_Author")
+def deployPublishJob = freeStyleJob(projectFolderName + "/AEM_Deploy_Publish")
+def buildAndDeployDispatcherJob = freeStyleJob(projectFolderName + "/AEM_Build_Deploy_Dispatcher")
+
+// Jobs
+def buildPackageJob = mavenJob(projectFolderName + "/AEM_Build_Package")
+def codeQualityAnalysisJob = freeStyleJob(projectFolderName + "/AEM_Code_Quality_Analysis")
+def unitTestsJob = mavenJob(projectFolderName + "/AEM_Unit_Tests")
+def publishJob = mavenJob(projectFolderName + "/AEM_Publish_to_Nexus")
+def deployPackageJob = freeStyleJob(projectFolderName + "/AEM_Deploy_Package")
+def deployContentJob = freeStyleJob(projectFolderName + "/AEM_Deploy_Content")
+
+// Views
+def pipelineView = buildPipelineView(projectFolderName + "/AEM")
+def aemEnvironmentView = buildPipelineView(projectFolderName + "/AEM_Environment")
+
+pipelineView.with {
+    title('AEM Pipeline')
+    displayedBuilds(5)
+    selectedJob(projectFolderName + "/AEM_Build_Package")
+    showPipelineParameters()
+    showPipelineDefinitionHeader()
+    refreshFrequency(5)
+}
+
+aemEnvironmentView.with {
+    title('AEM Environment Pipeline')
+    displayedBuilds(5)
+    selectedJob(projectFolderName + "/AEM_Build_Base_Image")
+    showPipelineParameters()
+    showPipelineDefinitionHeader()
+    refreshFrequency(5)
+}
+
+//Environment jobs
+buildandPushBaseImageJob.with {
+    configure { myProject ->
+        myProject / 'properties' / 'hudson.plugins.copyartifact.CopyArtifactPermissionProperty'(plugin: "copyartifact@1.35.2") / projectNameList {
+            string("*")
+        }
+    }
+    environmentVariables {
+        env('WORKSPACE_NAME', workspaceFolderName)
+        env('PROJECT_NAME', projectFolderName)
+        env('PROJECT_NAME_KEY', projectNameKey)
+        env('DOCKER_REGISTRY_USERNAME', dockerRegistryUser)
+        env('DOCKER_REGISTRY_EMAIL', dockerRegistryEmail)
+        env('DOCKER_REGISTRY_URL', dockerRegistryUrl)
+        env('DOCKER_REGISTRY_REPO', dockerRegistryRepo)
+	}
+    label("docker")
+    logRotator {
+        numToKeep(logRotatorNum)
+        artifactNumToKeep(logRotatorArtifactNum)
+        daysToKeep(logRotatorDays)
+        artifactDaysToKeep(logRotatorArtifactDays)
+    }
+    wrappers {
+        preBuildCleanup()
+        injectPasswords {
+            injectGlobalPasswords(false)
+            maskPasswordParameters(true)
+        }
+        sshAgent("adop-jenkins-master")
+    }
+    scm scmProvider.get("adopb-megatron", "megatron-aem-devops-tools", "*/master", "bitbucket-https-credentials", null)
+    configure { myProject ->
+        myProject / 'buildWrappers' / 'EnvInjectPasswordWrapper' (plugin:"envinject@1.91.3") << {
+            passwordEntries() {
+                'EnvInjectPasswordEntry' {
+                     name('DOCKER_REGISTRY_PASSWORD')
+                     value("$DOCKER_REGISTRY_PASSWORD")
+                }
+            }
+        }
+    }
+    steps {
+        shell('''set +x
+                |
+                |if [ ! -z ${DOCKER_REGISTRY_USERNAME} ]; then
+                |   echo "Docker registry username set, authenticating as ${DOCKER_REGISTRY_USERNAME}"
+                |   docker login -u "${DOCKER_REGISTRY_USERNAME}" -p "${DOCKER_REGISTRY_PASSWORD}" -e "${DOCKER_REGISTRY_EMAIL}" "${DOCKER_REGISTRY_URL}"
+                |else
+                |   echo "Docker registry username is not set, skipping authentication"
+                |fi
+                |
+                |cd ${WORKSPACE}/docker/base
+                |COUNT=1
+                |while ! docker build -t "${DOCKER_REGISTRY_URL}/${DOCKER_REGISTRY_REPO}/${PROJECT_NAME_KEY}-aem-base:${BUILD_NUMBER}" .
+                |do
+                |  if [ ${COUNT} -gt 10 ]; then
+                |      echo "Docker build failed even after ${COUNT}. Please investigate."
+                |      exit 1
+                |    fi
+                |    echo "Docker build failed. Retrying ..Attempt (${COUNT})"
+                |  COUNT=$((COUNT+1))
+                |done
+                |
+                |COUNT=1
+                |while ! docker push "${DOCKER_REGISTRY_URL}/${DOCKER_REGISTRY_REPO}/${PROJECT_NAME_KEY}-aem-base:${BUILD_NUMBER}"
+                |do
+                |  if [ ${COUNT} -gt 10 ]; then
+                |      echo "Docker push failed even after ${COUNT}. Please investigate."
+                |      exit 1
+                |    fi
+                |    echo "Docker push failed. Retrying ..Attempt (${COUNT})"
+                |  COUNT=$((COUNT+1))
+                |done
+                '''.stripMargin())
+    }
+    publishers {
+        archiveArtifacts("**/*")
+        downstreamParameterized {
+            trigger(projectFolderName + "/AEM_Build_Author_Publish_Image") {
+                condition("SUCCESS")
+                parameters {
+                    predefinedProp("B", '${BUILD_NUMBER}')
+                    predefinedProp("PARENT_BUILD", '${JOB_NAME}')
+                }
+            }
+        }
+    }
+}
+
+buildandPushImageJob.with {
+    parameters{
+        stringParam("B",'',"Parent build number")
+        stringParam("PARENT_BUILD", '', "Parent build job name")
+    }
+    environmentVariables {
+        env('WORKSPACE_NAME', workspaceFolderName)
+        env('PROJECT_NAME', projectFolderName)
+        env('PROJECT_NAME_KEY', projectNameKey)
+        env('DOCKER_REGISTRY_USERNAME', dockerRegistryUser)
+        env('DOCKER_REGISTRY_EMAIL', dockerRegistryEmail)
+        env('DOCKER_REGISTRY_URL', dockerRegistryUrl)
+        env('DOCKER_REGISTRY_REPO', dockerRegistryRepo)
+        env('AEM_PRODUCT_NAME', aemProductName)
+        env('AEM_CUSTOMER_NAME', aemCustomerName)
+        env('AEM_PRODUCT_VERSION', aemProductVersion)
+    }
+    label("docker")
+    logRotator {
+        numToKeep(logRotatorNum)
+        artifactNumToKeep(logRotatorArtifactNum)
+        daysToKeep(logRotatorDays)
+        artifactDaysToKeep(logRotatorArtifactDays)
+    }
+    wrappers {
+        preBuildCleanup()
+        injectPasswords {
+            injectGlobalPasswords(false)
+            maskPasswordParameters(true)
+        }
+        sshAgent("adop-jenkins-master")
+    }
+    configure { myProject ->
+        myProject / 'buildWrappers' / 'EnvInjectPasswordWrapper' (plugin:"envinject@1.91.3") << {
+            passwordEntries() {
+                'EnvInjectPasswordEntry' {
+                    name('DOCKER_REGISTRY_PASSWORD')
+                    value("$DOCKER_REGISTRY_PASSWORD")
+                }
+                'EnvInjectPasswordEntry' {
+                    name('AEM_DOWNLOAD_ID')
+                    value("$AEM_DOWNLOAD_ID")
+                }
+            }
+        }
+    }
+    steps {
+        copyArtifacts('${PARENT_BUILD}') {
+            includePatterns('docker/author-publish/*')
+            buildSelector {
+                buildNumber('${B}')
+            }
+        }
+        shell('''set +x
+                |
+                |if [ ! -z ${DOCKER_REGISTRY_USERNAME} ]; then
+                |   echo "Docker registry username set, authenticating as ${DOCKER_REGISTRY_USERNAME}"
+                |   docker login -u "${DOCKER_REGISTRY_USERNAME}" -p "${DOCKER_REGISTRY_PASSWORD}" -e "${DOCKER_REGISTRY_EMAIL}" "${DOCKER_REGISTRY_URL}"
+                |else
+                |   echo "Docker registry username is not set, skipping authentication"
+                |fi
+                |
+                |export IMAGE="${DOCKER_REGISTRY_URL}/${DOCKER_REGISTRY_REPO}/${PROJECT_NAME_KEY}_author:${B}"
+                |cd ${WORKSPACE}/docker/author-publish
+                |export BASE_IMAGE="${DOCKER_REGISTRY_URL}/${DOCKER_REGISTRY_REPO}/${PROJECT_NAME_KEY}-aem-base:${B}"
+                |sed -i "s|###TOKEN_IMAGE###|${BASE_IMAGE}|g" Dockerfile
+                |COUNT=1
+                |while ! docker build -t ${IMAGE} --build-arg AEM_PRODUCT_NAME="${AEM_PRODUCT_NAME}" --build-arg AEM_CUSTOMER_NAME="${AEM_CUSTOMER_NAME}" --build-arg AEM_PRODUCT_VERSION="${AEM_PRODUCT_VERSION}" --build-arg AEM_DOWNLOAD_ID="${AEM_DOWNLOAD_ID}" --build-arg port=4502 --build-arg mode=author .
+                |do
+                |  if [ ${COUNT} -gt 10 ]; then
+                |      echo "Docker build failed even after ${COUNT}. Please investigate."
+                |      exit 1
+                |    fi
+                |    echo "Docker build failed. Retrying ..Attempt (${COUNT})"
+                |  COUNT=$((COUNT+1))
+                |done
+                |
+                |COUNT=1
+                |while ! docker push ${IMAGE}
+                |do
+                |  if [ ${COUNT} -gt 10 ]; then
+                |      echo "Docker push failed even after ${COUNT}. Please investigate."
+                |      exit 1
+                |    fi
+                |    echo "Docker push failed. Retrying ..Attempt (${COUNT})"
+                |  COUNT=$((COUNT+1))
+                |done
+                |
+                |
+                |IMAGE="${DOCKER_REGISTRY_URL}/${DOCKER_REGISTRY_REPO}/${PROJECT_NAME_KEY}_publish:${B}"
+                |COUNT=1
+                |while ! docker build -t ${IMAGE} --build-arg AEM_PRODUCT_NAME="${AEM_PRODUCT_NAME}" --build-arg AEM_CUSTOMER_NAME="${AEM_CUSTOMER_NAME}" --build-arg AEM_PRODUCT_VERSION="${AEM_PRODUCT_VERSION}" --build-arg AEM_DOWNLOAD_ID="${AEM_DOWNLOAD_ID}" --build-arg port=4503 --build-arg mode=publish .
+                |do
+                |  if [ ${COUNT} -gt 10 ]; then
+                |      echo "Docker build failed even after ${COUNT}. Please investigate."
+                |      exit 1
+                |    fi
+                |    echo "Docker build failed. Retrying ..Attempt (${COUNT})"
+                |  COUNT=$((COUNT+1))
+                |done
+                |
+                |COUNT=1
+                |while ! docker push ${IMAGE}
+                |do
+                |  if [ ${COUNT} -gt 10 ]; then
+                |      echo "Docker push failed even after ${COUNT}. Please investigate."
+                |      exit 1
+                |    fi
+                |    echo "Docker push failed. Retrying ..Attempt (${COUNT})"
+                |  COUNT=$((COUNT+1))
+                |done
+                '''.stripMargin())
+        publishers {
+            downstreamParameterized {
+                trigger(projectFolderName + "/AEM_Deploy_Author") {
+                    condition("SUCCESS")
+                    parameters {
+                        predefinedProp("B", '${B}')
+                        predefinedProp("PARENT_BUILD", '${PARENT_BUILD}')
+                    }
+                }
+            }
+        }
+    }
+}
+
+deployAuthorJob.with {
+    parameters{
+        stringParam("B",'',"Parent build number")
+        stringParam("PARENT_BUILD",'',"Parent build name")
+        stringParam("ENVIRONMENT_MODE","author","AEM mode")
+    }
+    environmentVariables {
+        env('WORKSPACE_NAME', workspaceFolderName)
+        env('PROJECT_NAME', projectFolderName)
+        env('PROJECT_NAME_KEY', projectNameKey)
+        env('DOCKER_REGISTRY_URL', dockerRegistryUrl)
+        env('DOCKER_REGISTRY_REPO', dockerRegistryRepo)
+        groovy("matcher = JENKINS_URL =~ /http:\\/\\/(.*?)\\/jenkins.*/; def map = [STACK_IP: matcher[0][1]]; return map;")
+    }
+    label("docker")
+    wrappers {
+        preBuildCleanup()
+        injectPasswords {
+            injectGlobalPasswords()
+        }
+        maskPasswords()
+        sshAgent("adop-jenkins-master")
+    }
+    steps {
+        copyArtifacts('${PARENT_BUILD}') {
+            includePatterns('docker/docker-compose.${ENVIRONMENT_MODE}.yml', 'nginx/*')
+            buildSelector {
+                buildNumber('${B}')
+            }
+        }
+    }
+    steps {
+        shell('''set +x
+                |export SERVICE_NAME="${PROJECT_NAME_KEY}-${ENVIRONMENT_MODE}"
+                |export IMAGE="${DOCKER_REGISTRY_URL}/${DOCKER_REGISTRY_REPO}/${PROJECT_NAME_KEY}_${ENVIRONMENT_MODE}:${B}"
+                |
+                |sed -i "s%###TOKEN_IMAGE###%${IMAGE}%g" ${WORKSPACE}/docker/docker-compose.${ENVIRONMENT_MODE}.yml
+                |sed -i "s/###TOKEN_NAMESPACE###/${SERVICE_NAME}/g" ${WORKSPACE}/docker/docker-compose.${ENVIRONMENT_MODE}.yml
+                |docker-compose -p ${PROJECT_NAME_KEY} -f ${WORKSPACE}/docker/docker-compose.${ENVIRONMENT_MODE}.yml up -d --force-recreate
+                |
+                |# Generate nginx configuration
+                |nginx_sites_enabled_file="${SERVICE_NAME}.conf"
+                |cp ${WORKSPACE}/nginx/aem-mode.conf ${nginx_sites_enabled_file}
+                |sed -i "s/###TOKEN_NAMESPACE###/${SERVICE_NAME}/g" ${nginx_sites_enabled_file}
+                |sed -i "s/###TOKEN_IP###/${SERVICE_NAME}/g" ${nginx_sites_enabled_file}
+                |sed -i "s/###TOKEN_PORT###/4502/g" ${nginx_sites_enabled_file}
+                |
+                |# Copy the generated configuration file to nginx container
+                |docker cp ${nginx_sites_enabled_file} proxy:/etc/nginx/sites-enabled/${nginx_sites_enabled_file}
+                |
+                |# Reload Nginx configuration
+                |docker exec proxy /usr/sbin/nginx -s reload
+                |
+                |until [[ $(curl -I -s http://${SERVICE_NAME}:4502 | head -n 1 | cut -d$' ' -f2) == 401 ]]
+                |do
+                |    echo "AEM author not available, sleeping for 15 seconds"
+                |    sleep 15
+                |done
+                |
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |echo "AEM Author URL: http://${SERVICE_NAME}.${STACK_IP}.xip.io"
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |
+                |set -x'''.stripMargin())
+    }
+    publishers {
+        downstreamParameterized {
+            trigger(projectFolderName + "/AEM_Deploy_Publish") {
+                condition("SUCCESS")
+                parameters {
+                    predefinedProp("B", '${B}')
+                    predefinedProp("PARENT_BUILD", '${PARENT_BUILD}')
+                }
+            }
+        }
+    }
+}
+
+deployPublishJob.with {
+    parameters{
+        stringParam("B",'',"Parent build number")
+        stringParam("PARENT_BUILD",'',"Parent build name")
+        stringParam("ENVIRONMENT_MODE","publish","AEM mode")
+    }
+    environmentVariables {
+        env('WORKSPACE_NAME', workspaceFolderName)
+        env('PROJECT_NAME', projectFolderName)
+        env('PROJECT_NAME_KEY', projectNameKey)
+        env('DOCKER_REGISTRY_URL', dockerRegistryUrl)
+        env('DOCKER_REGISTRY_REPO', dockerRegistryRepo)
+        groovy("matcher = JENKINS_URL =~ /http:\\/\\/(.*?)\\/jenkins.*/; def map = [STACK_IP: matcher[0][1]]; return map;")
+    }
+    label("docker")
+    wrappers {
+        preBuildCleanup()
+        injectPasswords {
+            injectGlobalPasswords()
+        }
+        maskPasswords()
+        sshAgent("adop-jenkins-master")
+    }
+    steps {
+        copyArtifacts('${PARENT_BUILD}') {
+            includePatterns('docker/docker-compose.${ENVIRONMENT_MODE}.yml', 'nginx/*')
+            buildSelector {
+                buildNumber('${B}')
+            }
+        }
+    }
+    steps {
+        shell('''set +x
+                |export SERVICE_NAME="${PROJECT_NAME_KEY}-${ENVIRONMENT_MODE}"
+                |export IMAGE="${DOCKER_REGISTRY_URL}/${DOCKER_REGISTRY_REPO}/${PROJECT_NAME_KEY}_${ENVIRONMENT_MODE}:${B}"
+                |
+                |sed -i "s%###TOKEN_IMAGE###%${IMAGE}%g" ${WORKSPACE}/docker/docker-compose.${ENVIRONMENT_MODE}.yml
+                |sed -i "s/###TOKEN_NAMESPACE###/${SERVICE_NAME}/g" ${WORKSPACE}/docker/docker-compose.${ENVIRONMENT_MODE}.yml
+                |docker-compose -p ${PROJECT_NAME_KEY} -f ${WORKSPACE}/docker/docker-compose.${ENVIRONMENT_MODE}.yml up -d --force-recreate
+                |
+                |# Generate nginx configuration
+                |nginx_sites_enabled_file="${SERVICE_NAME}.conf"
+                |cp ${WORKSPACE}/nginx/aem-mode.conf ${nginx_sites_enabled_file}
+                |sed -i "s/###TOKEN_NAMESPACE###/${SERVICE_NAME}/g" ${nginx_sites_enabled_file}
+                |sed -i "s/###TOKEN_IP###/${SERVICE_NAME}/g" ${nginx_sites_enabled_file}
+                |sed -i "s/###TOKEN_PORT###/4503/g" ${nginx_sites_enabled_file}
+                |
+                |# Copy the generated configuration file to nginx container
+                |docker cp ${nginx_sites_enabled_file} proxy:/etc/nginx/sites-enabled/${nginx_sites_enabled_file}
+                |
+                |# Reload Nginx configuration
+                |docker exec proxy /usr/sbin/nginx -s reload
+                |
+                |until [[ $(curl -I -s http://${SERVICE_NAME}:4503 | head -n 1 | cut -d$' ' -f2) == 302 ]]
+                |do
+                |    echo "AEM publish not available, sleeping for 15 seconds"
+                |    sleep 15
+                |done
+                |
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |echo "AEM Publish URL: http://${SERVICE_NAME}.${STACK_IP}.xip.io"
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |
+                |set -x'''.stripMargin())
+    }
+    publishers {
+        downstreamParameterized {
+            trigger(projectFolderName + "/AEM_Build_Deploy_Dispatcher") {
+                condition("SUCCESS")
+                parameters {
+                    predefinedProp("B", '${B}')
+                    predefinedProp("PARENT_BUILD", '${PARENT_BUILD}')
+                }
+            }
+        }
+    }
+}
+
+buildAndDeployDispatcherJob.with {
+    parameters{
+        stringParam("B",'',"Parent build number")
+        stringParam("PARENT_BUILD", '', "Parent build job name")
+        stringParam("ENVIRONMENT_MODE","dispatcher","AEM mode")
+    }
+    environmentVariables {
+        env('WORKSPACE_NAME', workspaceFolderName)
+        env('PROJECT_NAME', projectFolderName)
+        env('PROJECT_NAME_KEY', projectNameKey)
+        env('DOCKER_REGISTRY_USERNAME', dockerRegistryUser)
+        env('DOCKER_REGISTRY_EMAIL', dockerRegistryEmail)
+        env('DOCKER_REGISTRY_URL', dockerRegistryUrl)
+        env('DOCKER_REGISTRY_REPO', dockerRegistryRepo)
+        groovy("matcher = JENKINS_URL =~ /http:\\/\\/(.*?)\\/jenkins.*/; def map = [STACK_IP: matcher[0][1]]; return map;")
+    }
+    label("docker")
+    logRotator {
+        numToKeep(logRotatorNum)
+        artifactNumToKeep(logRotatorArtifactNum)
+        daysToKeep(logRotatorDays)
+        artifactDaysToKeep(logRotatorArtifactDays)
+    }
+    wrappers {
+        preBuildCleanup()
+        injectPasswords {
+            injectGlobalPasswords(false)
+            maskPasswordParameters(true)
+        }
+        sshAgent("adop-jenkins-master")
+    }
+    configure { myProject ->
+    	myProject / 'buildWrappers' / 'EnvInjectPasswordWrapper' (plugin:"envinject@1.91.3") << {
+            passwordEntries() {
+                'EnvInjectPasswordEntry' {
+                    name('DOCKER_REGISTRY_PASSWORD')
+                    value("$DOCKER_REGISTRY_PASSWORD")
+                }
+            }
+        }
+    }
+    steps {
+        copyArtifacts('${PARENT_BUILD}') {
+            includePatterns('docker/dispatcher/*','docker/docker-compose.${ENVIRONMENT_MODE}.yml', 'nginx/*')
+            buildSelector {
+                buildNumber('${B}')
+            }
+        }
+        shell('''set +x
+                |
+                |if [ ! -z ${DOCKER_REGISTRY_USERNAME} ]; then
+                |   echo "Docker registry username set, authenticating as ${DOCKER_REGISTRY_USERNAME}"
+                |   docker login -u "${DOCKER_REGISTRY_USERNAME}" -p "${DOCKER_REGISTRY_PASSWORD}" -e "${DOCKER_REGISTRY_EMAIL}" "${DOCKER_REGISTRY_URL}"
+                |else
+                |   echo "Docker registry username is not set, skipping authentication"
+                |fi
+                |
+                |sed -i s/###TOKEN_PUBLISH_HOST###/${PROJECT_NAME_KEY}-publish/ ${WORKSPACE}/docker/dispatcher/dispatcher.any
+                |sed -i s/###TOKEN_PUBLISH_PORT###/4503/ ${WORKSPACE}/docker/dispatcher/dispatcher.any
+                |
+                |cd ${WORKSPACE}/docker/dispatcher
+                |export BASE_IMAGE="${DOCKER_REGISTRY_URL}/${DOCKER_REGISTRY_REPO}/${PROJECT_NAME_KEY}-aem-base:${B}"
+                |sed -i "s|###TOKEN_IMAGE###|${BASE_IMAGE}|g" Dockerfile
+                |COUNT=1
+                |while ! docker build -t "${DOCKER_REGISTRY_URL}/${DOCKER_REGISTRY_REPO}/${PROJECT_NAME_KEY}_${ENVIRONMENT_MODE}:${B}" .
+                |do
+                |  if [ ${COUNT} -gt 10 ]; then
+                |      echo "Docker build failed even after ${COUNT}. Please investigate."
+                |      exit 1
+                |    fi
+                |    echo "Docker build failed. Retrying ..Attempt (${COUNT})"
+                |  COUNT=$((COUNT+1))
+                |done
+                |
+                |COUNT=1
+                |while ! docker push "${DOCKER_REGISTRY_URL}/${DOCKER_REGISTRY_REPO}/${PROJECT_NAME_KEY}_${ENVIRONMENT_MODE}:${B}"
+                |do
+                |  if [ ${COUNT} -gt 10 ]; then
+                |      echo "Docker push failed even after ${COUNT}. Please investigate."
+                |      exit 1
+                |    fi
+                |    echo "Docker push failed. Retrying ..Attempt (${COUNT})"
+                |  COUNT=$((COUNT+1))
+                |done
+                |
+                |export SERVICE_NAME="${PROJECT_NAME_KEY}-${ENVIRONMENT_MODE}"
+                |export IMAGE="${DOCKER_REGISTRY_URL}/${DOCKER_REGISTRY_REPO}/${PROJECT_NAME_KEY}_${ENVIRONMENT_MODE}:${B}"
+                |
+                |sed -i "s%###TOKEN_IMAGE###%${IMAGE}%g" ${WORKSPACE}/docker/docker-compose.${ENVIRONMENT_MODE}.yml
+                |sed -i "s/###TOKEN_NAMESPACE###/${SERVICE_NAME}/g" ${WORKSPACE}/docker/docker-compose.${ENVIRONMENT_MODE}.yml
+                |docker-compose -p ${PROJECT_NAME_KEY} -f ${WORKSPACE}/docker/docker-compose.${ENVIRONMENT_MODE}.yml up -d --force-recreate
+                |
+                |# Generate nginx configuration
+                |nginx_sites_enabled_file="${SERVICE_NAME}.conf"
+                |cp ${WORKSPACE}/nginx/aem-mode.conf ${nginx_sites_enabled_file}
+                |sed -i "s/###TOKEN_NAMESPACE###/${SERVICE_NAME}/g" ${nginx_sites_enabled_file}
+                |sed -i "s/###TOKEN_IP###/${SERVICE_NAME}/g" ${nginx_sites_enabled_file}
+                |sed -i "s/###TOKEN_PORT###/80/g" ${nginx_sites_enabled_file}
+                |
+                |# Copy the generated configuration file to nginx container
+                |docker cp ${nginx_sites_enabled_file} proxy:/etc/nginx/sites-enabled/${nginx_sites_enabled_file}
+                |
+                |# Reload Nginx configuration
+                |docker exec proxy /usr/sbin/nginx -s reload
+                |
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |echo "AEM Dispatcher URL: http://${SERVICE_NAME}.${STACK_IP}.xip.io"
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |
+                '''.stripMargin())
+    }
+}
+
+buildPackageJob.with {
+    description("Build AEM reference package")
+    configure { myProject ->
+        myProject / 'properties' / 'hudson.plugins.copyartifact.CopyArtifactPermissionProperty'(plugin: "copyartifact@1.35.2") / projectNameList {
+            string("*")
+        }
+    }
+    environmentVariables {
+        env('WORKSPACE_NAME', workspaceFolderName)
+        env('PROJECT_NAME', projectFolderName)
+        env('CONTENT_ADMIN_USER', contentAdminUser)
+        env('CONTENT_ADMIN_PASS', contentAdminPass)
+        env('PROJECT_NAME_KEY', projectNameKey)
+    }
+    label("java8")
+    logRotator {
+        numToKeep(logRotatorNum)
+        artifactNumToKeep(logRotatorArtifactNum)
+        daysToKeep(logRotatorDays)
+        artifactDaysToKeep(logRotatorArtifactDays)
+    }
+    wrappers {
+        preBuildCleanup()
+        injectPasswords {
+            injectGlobalPasswords(false)
+            maskPasswordParameters(true)
+        }
+        sshAgent("adop-jenkins-master")
+    }
+    scm scmProvider.get(projectScmNamespace, gitRepoName, gitRepoBranch, "bitbucket-https-credentials", null)
+    triggers scmProvider.trigger(projectScmNamespace, gitRepoName, gitRepoBranch)
+    preBuildSteps {
+        shell('''set +x
+                |git_data=$(git --git-dir "${WORKSPACE}/.git" log -1 --pretty="format:%an<br/>%s%b")
+                |echo "GIT_LOG_DATA=${git_data}" > git_log_data.properties
+                '''.stripMargin())
+        environmentVariables {
+            propertiesFile('git_log_data.properties')
+        }
+    }
+    preBuildSteps {
+        systemGroovyCommand('''
+                            |import hudson.model.*;
+                            |import hudson.util.*;
+                            |
+                            |// Get current build number
+                            |def currentBuildNum = build.getEnvironment(listener).get('BUILD_NUMBER')
+                            |println "Build Number: " + currentBuildNum
+                            |
+                            |// Get Git Data
+                            |def gitData = build.getEnvironment(listener).get('GIT_LOG_DATA')
+                            |println "Git Data: " + gitData;
+                            |
+                            |def currentBuild = Thread.currentThread().executable;
+                            |def oldParams = currentBuild.getAction(ParametersAction.class)
+                            |
+                            |// Update the param
+                            |def params = [ new StringParameterValue("T",gitData), new StringParameterValue("B",currentBuildNum) ]
+                            |
+                            |// Remove old params - Plugins inject variables!
+                            |currentBuild.actions.remove(oldParams)
+                            |currentBuild.addAction(new ParametersAction(params));
+                            '''.stripMargin())
+    }
+    preBuildSteps {
+        shell('''
+		        |curl -u "${CONTENT_ADMIN_USER}":"${CONTENT_ADMIN_PASS}" -X POST http://author.dev.megatron-project.com:8080/crx/packmgr/service/.json/etc/packages/my_packages/TelecomPackage.zip?cmd=build
+		        |curl -u "${CONTENT_ADMIN_USER}":"${CONTENT_ADMIN_PASS}" http://author.dev.megatron-project.com:8080/etc/packages/export/TelecomPackage.zip > telecom_content.zip
+		        |
+        		|rm -rf ~/.m2/repository/com/accenture/megatron
+                |sed -i '/<module>ui.apps<\\/module>/a <module>ui.config<\\/module>' ${WORKSPACE}/pom.xml'''.stripMargin())
+    }
+    fingerprintingDisabled(true)
+    goals("-B -U -e clean install -DskipAllTests")
+    mavenInstallation("ADOP Maven")
+    mavenOpts("-XX:MaxPermSize=786m -Xmx1536m")
+    publishers {
+        archiveArtifacts("pom.xml, core/**/*, ui.*/**/*, it.*/**")
+        downstreamParameterized {
+            trigger(projectFolderName + "/AEM_Code_Quality_Analysis") {
+                condition("UNSTABLE_OR_BETTER")
+                parameters {
+                    predefinedProp("B",'${BUILD_NUMBER}')
+                    predefinedProp("PARENT_BUILD", '${JOB_NAME}')
+                }
+            }
+        }
+    }
+}
+
+codeQualityAnalysisJob.with {
+    description("Runs code quality analysis for AEM reference package using SonarQube")
+    parameters {
+        stringParam("B", "", "Build number of build job")
+        stringParam("PARENT_BUILD", "", "Job name of build job")
+    }
+    environmentVariables {
+        env('WORKSPACE_NAME', workspaceFolderName)
+        env('PROJECT_NAME', projectFolderName)
+        env('PROJECT_NAME_KEY', projectNameKey)
+    }
+    wrappers {
+        preBuildCleanup()
+        injectPasswords {
+            injectGlobalPasswords()
+        }
+        maskPasswords()
+        sshAgent("adop-jenkins-master")
+    }
+    steps {
+        copyArtifacts('${PARENT_BUILD}') {
+            buildSelector {
+                buildNumber('${B}')
+            }
+        }
+    }
+    configure { myProject ->
+        myProject / 'builders' << 'hudson.plugins.sonar.SonarRunnerBuilder'(plugin: "sonar@2.2.1") {
+            properties('''sonar.projectKey=${PROJECT_NAME_KEY}
+                         |sonar.projectName=${PROJECT_NAME}
+                         |sonar.projectVersion=0.0.${B}
+                         |sonar.language=java
+                         |sonar.scm.enabled=false
+                         |sonar.sources=.
+                         |'''.stripMargin())
+            javaOpts()
+            jdk('(Inherit From Job)')
+            task()
+        }
+    }
+    publishers {
+        downstreamParameterized {
+            trigger(projectFolderName + "/AEM_Unit_Tests") {
+                condition("UNSTABLE_OR_BETTER")
+                parameters {
+                    predefinedProp("B",'${B}')
+                    predefinedProp("PARENT_BUILD", '${PARENT_BUILD}')
+                }
+            }
+        }
+    }
+}
+
+unitTestsJob.with {
+    description("Test AEM reference package")
+    parameters{
+        stringParam("B", "", "Parent build number")
+        stringParam("PARENT_BUILD", "", "Parent build name")
+    }
+    environmentVariables {
+        env('WORKSPACE_NAME', workspaceFolderName)
+        env('PROJECT_NAME', projectFolderName)
+        env('PROJECT_NAME_KEY', projectNameKey)
+    }
+    label("java8")
+    logRotator {
+        numToKeep(logRotatorNum)
+        artifactNumToKeep(logRotatorArtifactNum)
+        daysToKeep(logRotatorDays)
+        artifactDaysToKeep(logRotatorArtifactDays)
+    }
+    wrappers {
+        preBuildCleanup()
+        injectPasswords {
+            injectGlobalPasswords(false)
+            maskPasswordParameters(true)
+        }
+        sshAgent("adop-jenkins-master")
+    }
+    preBuildSteps {
+        copyArtifacts('${PARENT_BUILD}') {
+            buildSelector {
+                buildNumber('${B}')
+            }
+        }
+    }
+    archivingDisabled(true)
+    siteArchivingDisabled(true)
+    fingerprintingDisabled(true)
+    goals("-U -e clean install -P pass-build-even-if-tests-fail")
+    mavenInstallation("ADOP Maven")
+    mavenOpts("-XX:MaxPermSize=786m -Xmx1536m")
+    publishers {
+        downstreamParameterized {
+            trigger(projectFolderName + "/AEM_Publish_to_Nexus") {
+                condition("UNSTABLE_OR_BETTER")
+                parameters {
+                    predefinedProp("B",'${B}')
+                    predefinedProp("PARENT_BUILD", '${PARENT_BUILD}')
+                }
+            }
+        }
+    }
+}
+
+publishJob.with{
+    description("Publish AEM reference package files to Nexus")
+    parameters{
+        stringParam("B", "", "Parent build number")
+        stringParam("PARENT_BUILD", "", "Parent build name")
+    }
+    environmentVariables {
+        env('WORKSPACE_NAME', workspaceFolderName)
+        env('PROJECT_NAME', projectFolderName)
+        env('PROJECT_NAME_KEY', projectNameKey)
+    }
+    label("java8")
+    logRotator {
+        numToKeep(logRotatorNum)
+        artifactNumToKeep(logRotatorArtifactNum)
+        daysToKeep(logRotatorDays)
+        artifactDaysToKeep(logRotatorArtifactDays)
+    }
+    wrappers {
+        preBuildCleanup()
+        injectPasswords {
+            injectGlobalPasswords(false)
+            maskPasswordParameters(true)
+        }
+        sshAgent("adop-jenkins-master")
+    }
+    preBuildSteps {
+        copyArtifacts('${PARENT_BUILD}') {
+            buildSelector {
+                buildNumber('${B}')
+            }
+        }
+    }
+    preBuildSteps {
+        shell('''set +x
+                |tar -zcf ${PROJECT_NAME_KEY}-aem.tar.gz *
+                |set -x'''.stripMargin())
+        }
+    fingerprintingDisabled(true)
+    goals('deploy:deploy-file -Dversion=${B} -DgeneratePom=true -Dpackaging=tgz -Dfile=${PROJECT_NAME_KEY}-aem.tar.gz -DgroupId=MEGATRON -DartifactId=${PROJECT_NAME_KEY} -DrepositoryId=releases -Durl=http://nexus:8081/nexus/content/repositories/releases')
+    mavenInstallation("ADOP Maven")
+    mavenOpts("-XX:MaxPermSize=786m -Xmx1536m")
+    publishers {
+        archiveArtifacts("pom.xml, core/**/*, ui.*/**/*, it.*/**")
+        downstreamParameterized {
+            trigger(projectFolderName + "/AEM_Deploy_Package") {
+                condition("UNSTABLE_OR_BETTER")
+                parameters {
+                    predefinedProp("B",'${B}')
+                    predefinedProp("PARENT_BUILD", '${PARENT_BUILD}')
+                }
+            }
+        }
+    }
+}
+
+deployPackageJob.with {
+    description("Deploys reference package on AEM author and publish instances")
+    parameters {
+        stringParam("B", "", "Build number of build job")
+        stringParam("PARENT_BUILD", "", "Job name of build job")
+        stringParam("AUTHOR_CONTAINER_NAME", projectNameKey+"-author", "Name of container where AEM Author is running")
+        stringParam("AUTHOR_PORT", "4502", "Port where AEM Author is accessible")
+        stringParam("PUBLISH_CONTAINER_NAME", projectNameKey+"-publish", "Name of container where AEM Publish is running")
+        stringParam("PUBLISH_PORT", "4503", "Port where AEM Publish is accessible")
+    }
+    environmentVariables {
+        env('WORKSPACE_NAME', workspaceFolderName)
+        env('PROJECT_NAME', projectFolderName)
+        env('PROJECT_NAME_KEY', projectNameKey)
+        groovy("matcher = JENKINS_URL =~ /http:\\/\\/(.*?)\\/jenkins.*/; def map = [STACK_IP: matcher[0][1]]; return map;")
+    }
+    label("docker")
+    wrappers {
+        preBuildCleanup()
+        injectPasswords {
+            injectGlobalPasswords()
+        }
+        maskPasswords()
+        sshAgent("adop-jenkins-master")
+    }
+    steps {
+        copyArtifacts('${PARENT_BUILD}') {
+            buildSelector {
+                buildNumber('${B}')
+            }
+        }
+        maven {
+            goals('clean install -PautoInstallPackage')
+            mavenInstallation("ADOP Maven")
+            mavenOpts("-XX:MaxPermSize=786m -Xmx1536m")
+            property("aem.host", '${AUTHOR_CONTAINER_NAME}')
+            property("aem.port", '${AUTHOR_PORT}' )
+        }
+        maven {
+            goals('clean install -PautoInstallPackagePublish')
+            mavenInstallation("ADOP Maven")
+            mavenOpts("-XX:MaxPermSize=786m -Xmx1536m")
+            property("aem.publish.host", '${PUBLISH_CONTAINER_NAME}')
+            property("aem.publish.port", '${PUBLISH_PORT}')
+        }
+    }
+    steps {
+        shell('''set +x
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |echo "Package deployed here: http://${PUBLISH_CONTAINER_NAME}.${STACK_IP}.xip.io/content/telecom/en.html"
+                |echo "Package available from dispatcher here: http://${PROJECT_NAME_KEY}-dispatcher.${STACK_IP}.xip.io/content/telecom/en.html"
+                |echo "Bundle available here: http://${AUTHOR_CONTAINER_NAME}.${STACK_IP}.xip.io/content/telecom/en.html"
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."
+                |echo "=.=.=.=.=.=.=.=.=.=.=.=."'''.stripMargin())
+    }
+    publishers {
+        downstream(projectFolderName + "/AEM_Deploy_Content", "SUCCESS")
+    }
+}
+
+deployContentJob.with{
+    description("Deploys and installs AEM content on author and publish instances")
+    environmentVariables {
+        env('WORKSPACE_NAME', workspaceFolderName)
+        env('PROJECT_NAME', projectFolderName)
+        env('PROJECT_NAME_KEY', projectNameKey)
+        env('CONTENT_ADMIN_USER', contentAdminUser)
+        env('CONTENT_ADMIN_PASS', contentAdminPass)
+        groovy("matcher = JENKINS_URL =~ /http:\\/\\/(.*?)\\/jenkins.*/; def map = [STACK_IP: matcher[0][1]]; return map;")
+    }
+    scm scmProvider.get("adopb-megatron", "megatron-aem-content", "*/master", "bitbucket-https-credentials", null)
+    wrappers {
+        preBuildCleanup()
+        injectPasswords {
+            injectGlobalPasswords()
+        }
+        maskPasswords()
+        sshAgent("adop-jenkins-master")
+    }
+    steps {
+        shell('''curl -u admin:admin -F file=@"telecom_content.zip" -F name="telecom_content" -F force=true -F install=true http://${PROJECT_NAME_KEY}-publish.${STACK_IP}.xip.io/crx/packmgr/service.jsp
+                |curl -u admin:admin -F file=@"DAMAssets.zip" -F name="DAMAssets" -F force=true -F install=true http://${PROJECT_NAME_KEY}-publish.${STACK_IP}.xip.io/crx/packmgr/service.jsp
+				|
+				|curl -u "${CONTENT_ADMIN_USER}":"${CONTENT_ADMIN_PASS}" -F package=@"telecom_content.zip" http://localhost:4505/crx/packmgr/service/.json/?cmd=upload
+				|curl -u "${CONTENT_ADMIN_USER}":"${CONTENT_ADMIN_PASS}" -X POST http://localhost:4505/crx/packmgr/service/.json/etc/packages/export/telecom_content.zip?cmd=install
+				'''.stripMargin())
+
+	}
+}
